@@ -1,26 +1,18 @@
-from typing import Optional, Callable, Any, Union, Sequence
+from typing import Optional, Union, Sequence
 import tarfile
 import zipfile
 from tempfile import TemporaryDirectory
 import os
 import platform
-from urllib import request
 from urllib.error import HTTPError
-import http.client
 import shutil
 from importlib import resources
 import subprocess
 import re
 
 from reconstructor import errors
+from reconstructor.utils import download, CallbackT, DownloadProgress
 
-
-_CALLBACK = Callable[[int, int, int], Any]
-_DOWNLOAD_PROGRESS = lambda count, block, total: print(
-    f"\rDownloading... {count*block/total:.1%}",
-    end=("" if count*block < total else "\n"),
-    flush=True
-)
 
 DEFAULT_DIAMOND_VERSION = "2.1.14"
 _DIAMOND_URL_TEMPLATE = "https://github.com/bbuchfink/diamond/releases/download/v{version}/diamond-{system}{ext}"
@@ -39,14 +31,16 @@ class Diamond:
             if bin_path is None:
                 raise errors.DiamondNotFoundError()
         self.path: str = str(bin_path)
-    
+
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({repr(self.path)})"
-    
+
     def __str__(self) -> str:
         return f"DIAMOND v{self.get_version()} ({self.path})"
-    
-    def __call__(self, options: Sequence[str], *args, **kwargs) -> subprocess.CompletedProcess:
+
+    def __call__(
+        self, options: Sequence[str], *args, **kwargs
+    ) -> subprocess.CompletedProcess:
         options = [self.path] + options
         result: subprocess.CompletedProcess = subprocess.run(options, *args, **kwargs)
         try:
@@ -57,40 +51,44 @@ class Diamond:
             return result
 
     def blastp(
-            self,
-            db: Union[str, bytes, os.PathLike],
-            query: Union[str, bytes, os.PathLike],
-            out: Optional[Union[str, bytes, os.PathLike]] = None,
-            *options: str,
-            **sp_kwargs
-        ):
+        self,
+        db: Union[str, bytes, os.PathLike],
+        query: Union[str, bytes, os.PathLike],
+        out: Optional[Union[str, bytes, os.PathLike]] = None,
+        *options: str,
+        **sp_kwargs,
+    ):
         args = ["blastp", "--db", db, "--query", query]
         if out is not None:
             args.extend(["--out", out])
-        args.extend(options)
+        args.extend([str(x) for x in options])
         return self.__call__(args, **sp_kwargs)
-    
+
     def get_version(self):
         args = ["version"]
-        result: subprocess.CompletedProcess[str] = self.__call__(args, capture_output=True, text=True)
+        result: subprocess.CompletedProcess[str] = self.__call__(
+            args, capture_output=True, text=True
+        )
         pattern = re.compile(r"diamond version (\d+\.\d+\.\d+)")
         version = pattern.sub(r"\1", result.stdout.strip())
         return version
-    
+
 
 def get_diamond_path(name: Optional[str] = None) -> Optional[str]:
     """
-    Get the path to a DIAMOND executable or raise an error if one is not found.
+    Get the path to a DIAMOND executable or return None if one is not found.
 
     Checks the following locations (in the order shown) and returns the first
     one that is found:
 
     1. reconstructor/bin/ (a bin folder inside the reconstructor package directory)
     2. The user's PATH by calling `shutil.which(name)`
+
+    If DIAMOND is not found, then `None` is returned.
     """
     if name is None:
         name = "diamond.exe" if platform.system() == "Windows" else "diamond"
-    
+
     # Check the bin folder inside reconstructor
     path = _BIN_DIR.joinpath(name)
     if os.path.exists(path):
@@ -101,25 +99,25 @@ def get_diamond_path(name: Optional[str] = None) -> Optional[str]:
 
 
 def download_diamond(
-        dir: Optional[Union[str, bytes, os.PathLike]] = _BIN_DIR,
-        diamond_version: str = DEFAULT_DIAMOND_VERSION,
-        bin_name: Optional[str] = None,
-        callback: Optional[_CALLBACK] = _DOWNLOAD_PROGRESS
-    ) -> str:
+    dir: Optional[Union[str, bytes, os.PathLike]] = _BIN_DIR,
+    diamond_version: str = DEFAULT_DIAMOND_VERSION,
+    bin_name: Optional[str] = None,
+    callback: Optional[CallbackT] = DownloadProgress("Downloading DIAMOND..."),
+) -> str:
     """
     Download the appropriate DIAMOND binary for the operating system from
     [GitHub](https://github.com/bbuchfink/diamond/releases).
     """
     if dir is _BIN_DIR and not os.path.exists(_BIN_DIR):
         os.mkdir(_BIN_DIR)
-    
+
     system = platform.system()
     if system == "Windows":
         return _download_windows(dir, diamond_version, bin_name, callback)
-    
+
     if dir is None:
         dir = ""
-    
+
     if system == "Darwin":
         return _download_macos(dir, diamond_version, bin_name, callback)
     if system == "Linux":
@@ -135,64 +133,75 @@ def cleanup_bin():
         shutil.rmtree(_BIN_DIR)
 
 
-def _download_windows(dir: Optional[Union[str, bytes, os.PathLike]], diamond_version: str, bin_name: Optional[str], callback: Optional[_CALLBACK] = None) -> str:
+def _download_windows(
+    dir: Optional[Union[str, bytes, os.PathLike]],
+    diamond_version: str,
+    bin_name: Optional[str],
+    callback: Optional[CallbackT] = None,
+) -> str:
     if bin_name is None:
         bin_name = _WINDOWS_BIN
 
     with TemporaryDirectory() as tempdir:
-        download_path = _download_archive(tempdir, diamond_version, "windows", ".zip", callback)
+        download_path = _download_archive(
+            tempdir, diamond_version, "windows", ".zip", callback
+        )
         with zipfile.ZipFile(download_path, "r") as zfile:
             zfile.extract(bin_name, dir)
 
     return os.path.join(dir, bin_name)
 
 
-def _download_macos(dir: Optional[Union[str, bytes, os.PathLike]], diamond_version: str, bin_name: Optional[str], callback: Optional[_CALLBACK] = None) -> str:
+def _download_macos(
+    dir: Optional[Union[str, bytes, os.PathLike]],
+    diamond_version: str,
+    bin_name: Optional[str],
+    callback: Optional[CallbackT] = None,
+) -> str:
     if bin_name is None:
         bin_name = _MACOS_BIN
 
     with TemporaryDirectory() as tempdir:
-        download_path = _download_archive(tempdir, diamond_version, "macos", ".tar.gz", callback)
+        download_path = _download_archive(
+            tempdir, diamond_version, "macos", ".tar.gz", callback
+        )
         with tarfile.open(download_path, "r:gz") as tar:
             tar.extract(bin_name, dir)
-    
+
     return os.path.join(dir, bin_name)
 
 
-def _download_linux(dir: Optional[Union[str, bytes, os.PathLike]], diamond_version: str, bin_name: Optional[str], callback: Optional[_CALLBACK] = None) -> str:
+def _download_linux(
+    dir: Optional[Union[str, bytes, os.PathLike]],
+    diamond_version: str,
+    bin_name: Optional[str],
+    callback: Optional[CallbackT] = None,
+) -> str:
     if bin_name is None:
         bin_name = _LINUX_BIN
 
     with TemporaryDirectory() as tempdir:
-        download_path = _download_archive(tempdir, diamond_version, "linux64", ".tar.gz", callback)
+        download_path = _download_archive(
+            tempdir, diamond_version, "linux64", ".tar.gz", callback
+        )
         with tarfile.open(download_path, "r:gz") as tar:
             tar.extract(bin_name, dir)
-    
+
     return os.path.join(dir, bin_name)
 
 
-def _download_archive(dir: Optional[Union[str, bytes, os.PathLike]], diamond_version: str, system: str, ext: str, callback: Optional[_CALLBACK] = None) -> str:
+def _download_archive(
+    dir: Optional[Union[str, bytes, os.PathLike]],
+    diamond_version: str,
+    system: str,
+    ext: str,
+    callback: Optional[CallbackT] = None,
+) -> str:
     url = _DIAMOND_URL_TEMPLATE.format(version=diamond_version, system=system, ext=ext)
     download_path = os.path.join(dir, "diamond.zip")
 
     try:
-        with request.urlopen(url) as response, open(download_path, "wb") as file:
-            response: http.client.HTTPResponse
-            total_size = int(response.info().get("content-length", 0))
-            block_size = 16 * 1024
-            count = 0
-            
-            while True:
-                chunk = response.read(block_size)
-                if not chunk:
-                    break
-
-                count += 1
-                file.write(chunk)
-
-                if callback is not None:
-                    callback(count, block_size, total_size)
-
+        download(url, download_path, callback)
     except HTTPError as e:
         raise errors.DiamondDownloadError(e, diamond_version, system) from e
 
